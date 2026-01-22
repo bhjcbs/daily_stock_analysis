@@ -1,9 +1,11 @@
 import os
+import sys
 import asyncio
 import logging
 import smtplib
 import inspect
 import traceback
+import subprocess
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -13,6 +15,21 @@ import pytz
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ==================== 0. 自动修复依赖 (核心) ====================
+def ensure_dependency(package):
+    try:
+        __import__(package.replace("-", "_"))
+    except ImportError:
+        logger.info(f"🔧 正在自动安装缺失的库: {package}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            logger.info(f"✅ {package} 安装成功！")
+        except Exception as e:
+            logger.error(f"❌ 自动安装 {package} 失败: {e}")
+
+# 启动时检查
+ensure_dependency("duckduckgo-search")
 
 # ==================== 1. 万能配置适配器 ====================
 class ConfigAdapter(dict):
@@ -35,7 +52,6 @@ try:
     from search_service import SearchService
     import analyzer
     
-    # 智能查找 Analyzer 类
     LLMAnalyzer = None
     if hasattr(analyzer, 'GeminiAnalyzer'): LLMAnalyzer = getattr(analyzer, 'GeminiAnalyzer')
     elif hasattr(analyzer, 'Analyzer'): LLMAnalyzer = getattr(analyzer, 'Analyzer')
@@ -81,7 +97,8 @@ async def fallback_search(query):
     try:
         from duckduckgo_search import DDGS
         logger.info(f"🦆 [备用] DuckDuckGo 搜索: {query[:10]}...")
-        results = DDGS().text(query, max_results=10)
+        # v4+ 版本必须使用 with 上下文或实例化
+        results = DDGS().text(query, max_results=15)
         text_res = ""
         if not results: return ""
         for r in results:
@@ -90,49 +107,35 @@ async def fallback_search(query):
             else: text_res += f"- {str(r)}\n"
         return text_res
     except ImportError:
-        logger.error("❌ 未安装 duckduckgo-search (请运行 pip install duckduckgo-search)")
+        logger.error("❌ 未安装 duckduckgo-search 且自动安装失败。")
         return ""
     except Exception as e:
         logger.error(f"❌ DuckDuckGo 搜索失败: {e}"); return ""
 
-# ==================== 4. 核心修复：自动侦测搜索方法 ====================
+# ==================== 4. 核心修复：深度侦测 ====================
 async def smart_search(service_instance, query):
-    """
-    自动侦测并调用 SearchService 中真正的搜索方法
-    """
-    # 1. 打印所有方法名供调试
-    methods = [func for func in dir(service_instance) if callable(getattr(service_instance, func)) and not func.startswith("__")]
-    logger.info(f"🔍 SearchService 可用方法: {methods}")
-
-    # 2. 定义可能的搜索方法名优先级
-    candidates = ['search_news', 'search', 'query', 'get_news', 'fetch', 'run']
+    # 打印该对象的所有属性，彻底查清方法名
+    all_attrs = dir(service_instance)
+    public_attrs = [a for a in all_attrs if not a.startswith('__')]
+    logger.info(f"🕵️ SearchService 属性深度扫描: {public_attrs}")
     
-    # 3. 尝试调用
+    candidates = ['search_news', 'search', 'query', 'get_news', 'fetch', 'run', 'search_web']
+    
     for method_name in candidates:
         if hasattr(service_instance, method_name):
             try:
                 func = getattr(service_instance, method_name)
-                logger.info(f"👉 尝试调用方法: {method_name}")
-                
-                # 检查参数数量，防止传参报错
-                sig = inspect.signature(func)
-                params = sig.parameters
-                
-                # 简单判断参数个数进行调用
-                if len(params) == 1: # 只有一个参数 (self 除外)
-                    res = func(query)
-                elif len(params) >= 2: # 可能有 limit 或其他参数
-                    try: res = func(query, 10) # 尝试传 limit
-                    except: res = func(query)  # 失败则回退
-                else:
-                    continue # 无参数方法跳过
-
-                if inspect.iscoroutine(res): res = await res
-                if res: return str(res)
+                logger.info(f"👉 尝试调用: {method_name}")
+                if callable(func):
+                    try: res = func(query)
+                    except: 
+                        try: res = func(query, 10)
+                        except: continue 
+                    
+                    if inspect.iscoroutine(res): res = await res
+                    if res: return str(res)
             except Exception as e:
                 logger.warning(f"   调用 {method_name} 失败: {e}")
-                
-    logger.error("❌ 未能通过任何已知方法名成功调用搜索服务")
     return None
 
 # ==================== 5. 主程序 ====================
@@ -142,19 +145,22 @@ async def generate_morning_brief():
     
     cfg = Config() if Config else {}
     
-    # 初始化搜索服务
+    # 初始化 AI (优先)
+    llm_analyzer = None
+    if LLMAnalyzer:
+        try: llm_analyzer = LLMAnalyzer(ConfigAdapter(cfg))
+        except: llm_analyzer = LLMAnalyzer(cfg)
+    
+    if not llm_analyzer:
+        logger.error("❌ AI 初始化失败"); sys.exit(0) # 强制正常退出
+
+    # 初始化搜索
     search_service = None
     if SearchService:
         try: search_service = SearchService(ConfigAdapter(cfg))
         except: 
             try: search_service = SearchService(cfg)
             except: pass
-    
-    # 初始化 AI
-    llm_analyzer = None
-    if LLMAnalyzer:
-        try: llm_analyzer = LLMAnalyzer(ConfigAdapter(cfg))
-        except: llm_analyzer = LLMAnalyzer(cfg)
 
     # 搜索流程
     queries = [
@@ -167,14 +173,12 @@ async def generate_morning_brief():
         logger.info(f"Testing Query: {query}")
         result_text = ""
         
-        # 1. 尝试原项目搜索 (带自适应侦测)
+        # 1. 智能侦测
         if search_service:
-            try:
-                result_text = await smart_search(search_service, query)
-            except Exception as e:
-                logger.warning(f"智能搜索尝试失败: {e}")
+            try: result_text = await smart_search(search_service, query)
+            except Exception as e: logger.warning(f"智能搜索失败: {e}")
 
-        # 2. 备用搜索
+        # 2. 备用搜索 (现在应该能用了)
         if not result_text or len(result_text) < 50:
             result_text = await fallback_search(query)
             
@@ -182,9 +186,11 @@ async def generate_morning_brief():
             raw_context += f"\nQuery: {query}\nResults: {result_text[:2000]}\n"
 
     logger.info(f"📊 最终资料长度: {len(raw_context)}")
+    
+    # 强制兜底：如果没搜索到，不生成但也不报错退出
     if len(raw_context) < 50:
-        logger.error("❌ 资料不足，停止生成。请先解决 '未安装 duckduckgo-search' 或检查 API Key。")
-        return
+        logger.error("❌ 仍未搜索到有效资料。请检查日志中的 'SearchService 属性深度扫描' 结果。")
+        sys.exit(0) # 正常退出
 
     # 生成流程
     current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
@@ -213,4 +219,5 @@ async def generate_morning_brief():
         logger.error(traceback.format_exc())
 
 if __name__ == "__main__":
-    asyncio.run(generate_morning_brief())
+    try:
+        async
