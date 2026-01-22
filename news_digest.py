@@ -7,6 +7,8 @@ import smtplib
 import subprocess
 import inspect
 import traceback
+import json
+import ssl
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -17,7 +19,7 @@ import pytz
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ==================== 0. 基础环境检查 ====================
+# ==================== 0. 自动依赖检查 (增加 feedparser) ====================
 def install_package(package):
     try:
         logger.info(f"🔧 自动安装依赖: {package}...")
@@ -25,19 +27,63 @@ def install_package(package):
     except Exception as e:
         logger.warning(f"❌ 安装 {package} 失败: {e}")
 
-# 检查必要库
+# 1. RSS 解析库 (最稳的兜底)
 try:
-    import duckduckgo_search
+    import feedparser
 except ImportError:
-    install_package("duckduckgo-search")
+    install_package("feedparser")
+    import feedparser
 
+# 2. 搜索库 (新版)
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    install_package("duckduckgo-search>=6.0.0")
+    from duckduckgo_search import DDGS
+
+# 3. Gemini SDK
 try:
     import google.generativeai as genai
 except ImportError:
     install_package("google-generativeai")
     import google.generativeai as genai
 
-# ==================== 1. 独立 Gemini 客户端 (兜底) ====================
+# ==================== 1. RSS 硬兜底 (杀手锏) ====================
+# 当搜索挂掉时，直接读取这些官方源，100% 可用
+RSS_SOURCES = {
+    "Sina_Global": "https://rss.sina.com.cn/news/world/focus15.xml",
+    "Sina_Finance": "https://rss.sina.com.cn/roll/finance/hot_roll.xml",
+    "EastMoney": "http://www.eastmoney.com/rss/msg.xml",
+    "WallstreetCN": "https://wallstreetcn.com/rss/live.xml" 
+}
+
+def fetch_rss_news():
+    """读取 RSS 源获取最新财经新闻 (不受反爬虫影响)"""
+    logger.info("📡 [RSS] 启动硬兜底模式，正在读取官方新闻源...")
+    combined_text = ""
+    
+    # 忽略 SSL 验证，防止 Actions 环境下的证书问题
+    if hasattr(ssl, '_create_unverified_context'):
+        ssl._create_default_https_context = ssl._create_unverified_context
+
+    for name, url in RSS_SOURCES.items():
+        try:
+            feed = feedparser.parse(url)
+            logger.info(f"   - 读取 {name}: 获取到 {len(feed.entries)} 条")
+            
+            # 只取前 10 条，避免 token 爆炸
+            for entry in feed.entries[:10]:
+                title = entry.get('title', '')
+                summary = entry.get('summary', entry.get('description', ''))
+                # 清洗 HTML 标签
+                summary = summary.replace('<p>', '').replace('</p>', '').replace('<br>', '')
+                combined_text += f"Source: {name} (RSS)\nTitle: {title}\nSummary: {summary[:200]}\n---\n"
+        except Exception as e:
+            logger.warning(f"   - 读取 {name} 失败: {e}")
+            
+    return combined_text
+
+# ==================== 2. 独立 Gemini 客户端 ====================
 class DirectGeminiClient:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
@@ -45,36 +91,16 @@ class DirectGeminiClient:
             raise ValueError("环境变量 GEMINI_API_KEY 未配置")
         
         genai.configure(api_key=api_key)
-        # 尝试使用 flash 模型，速度快且适合长文本
         self.model = genai.GenerativeModel('gemini-1.5-flash')
         logger.info("💎 [独立模式] Gemini 客户端就绪")
 
     async def chat(self, prompt):
         try:
-            # 同步方法在异步中通常也能运行，除非并发极高
             response = self.model.generate_content(prompt)
             return response.text
         except Exception as e:
             logger.error(f"❌ Gemini API 调用失败: {e}")
             return None
-
-# ==================== 2. 配置适配器 ====================
-class ConfigAdapter(dict):
-    """兼容字典和对象属性访问"""
-    def __init__(self, original_config):
-        self._orig = original_config
-        data = {}
-        if isinstance(original_config, dict): data = original_config
-        elif hasattr(original_config, 'dict'): data = original_config.dict()
-        elif hasattr(original_config, '__dict__'): data = vars(original_config)
-        super().__init__(data)
-        self.__dict__.update(data)
-
-    def __getattr__(self, item):
-        val = self.get(item)
-        if val is not None: return val
-        if hasattr(self._orig, item): return getattr(self._orig, item)
-        return None
 
 # ==================== 3. 邮件发送 ====================
 def send_email_standalone(subject, html_content):
@@ -88,7 +114,6 @@ def send_email_standalone(subject, html_content):
 
     receivers = [r.strip() for r in receivers_str.split(',')] if receivers_str else [sender]
     
-    # 简单的 SMTP 策略
     smtp_server, smtp_port = "smtp.qq.com", 465
     if "@163.com" in sender: smtp_server = "smtp.163.com"
     elif "@gmail.com" in sender: smtp_server, smtp_port = "smtp.gmail.com", 587
@@ -113,28 +138,42 @@ def send_email_standalone(subject, html_content):
         logger.error(f"❌ 邮件发送异常: {e}")
         return False
 
-# ==================== 4. 搜索模块 ====================
-async def search_with_ddg(query):
-    """使用 DuckDuckGo 搜索"""
+# ==================== 4. 混合搜索模块 ====================
+async def robust_search(query):
+    """尝试 API 搜索 -> DDG 搜索"""
+    text_res = ""
+    
+    # 1. 尝试 Tavily API (如果你配置了)
+    tavily_key = os.getenv("TAVILY_API_KEYS")
+    if tavily_key:
+        try:
+            logger.info("🕵️ 尝试 Tavily API 搜索...")
+            # 简单的 HTTP 请求模拟，避免依赖 tavily-python 库
+            import urllib.request
+            req_data = json.dumps({"query": query, "api_key": tavily_key, "search_depth": "basic", "max_results": 10}).encode('utf-8')
+            req = urllib.request.Request("https://api.tavily.com/search", data=req_data, headers={'content-type': 'application/json'})
+            with urllib.request.urlopen(req) as f:
+                resp = json.loads(f.read().decode('utf-8'))
+                for r in resp.get('results', []):
+                    text_res += f"Src: {r['title']}\nTxt: {r['content']}\n---\n"
+            logger.info("✅ Tavily 搜索成功")
+            return text_res
+        except Exception as e:
+            logger.warning(f"⚠️ Tavily 搜索失败: {e}")
+
+    # 2. 尝试 DDG
     try:
-        from duckduckgo_search import DDGS
-        logger.info(f"🦆 [DDG] 搜索: {query[:15]}...")
-        # 增加 max_results 以获取更多信息
-        results = DDGS().text(query, max_results=20)
-        text_res = ""
-        if not results: return ""
-        
-        for r in results:
-            if isinstance(r, dict):
-                title = r.get('title', '?')
-                body = r.get('body', r.get('snippet', ''))
-                text_res += f"Src: {title}\nTxt: {body}\n---\n"
-            else:
-                text_res += f"{str(r)}\n---\n"
-        return text_res
+        logger.info(f"🦆 [DDG] 搜索: {query[:10]}...")
+        results = DDGS().text(query, max_results=15)
+        if results:
+            for r in results:
+                if isinstance(r, dict):
+                    text_res += f"Src: {r.get('title','?')}\nTxt: {r.get('body', r.get('snippet',''))}\n---\n"
+            return text_res
     except Exception as e:
         logger.error(f"❌ DDG 搜索失败: {e}")
-        return ""
+    
+    return ""
 
 # ==================== 5. 主程序 ====================
 async def generate_morning_brief():
@@ -142,114 +181,75 @@ async def generate_morning_brief():
     logger.info("🚀 每日早报任务启动")
     
     # --- 1. 初始化 AI ---
-    llm_client = None
-    
-    # 尝试加载项目原有代码 (A计划)
     try:
-        from config import Config
-        import analyzer
-        cfg = Config() if Config else {}
-        adapter = ConfigAdapter(cfg)
-        
-        # 寻找 Analyzer 类
-        AnalyzerCls = None
-        candidates = ['GeminiAnalyzer', 'GoogleGeminiAnalyzer', 'Analyzer']
-        for name in candidates:
-            if hasattr(analyzer, name):
-                AnalyzerCls = getattr(analyzer, name); break
-        
-        if not AnalyzerCls:
-             for name, cls in inspect.getmembers(analyzer, inspect.isclass):
-                if 'Analyzer' in name: AnalyzerCls = cls; break
-        
-        if AnalyzerCls:
-            try: llm_client = AnalyzerCls(adapter)
-            except: llm_client = AnalyzerCls(cfg)
-            logger.info("✅ 已加载项目原生 AI 分析器")
+        llm_client = DirectGeminiClient()
     except Exception as e:
-        logger.warning(f"⚠️ 项目模块加载受限: {e}")
+        logger.error(f"❌ 无法初始化 AI: {e}")
+        sys.exit(0)
 
-    # 独立 Gemini 客户端 (B计划)
-    if not llm_client:
-        try:
-            llm_client = DirectGeminiClient()
-        except Exception as e:
-            logger.error(f"❌ 无法初始化任何 AI 客户端: {e}")
-            sys.exit(0)
-
-    # --- 2. 执行搜索 ---
-    queries = [
-        "过去24小时 中国股市 A股 港股 重大财经新闻 利好利空",
-        "latest China stock market rumors and insider news last 24 hours",
-        "A股 市场小作文 传闻 24小时内 热门",
-        "新浪财经 东方财富 财联社 头条新闻 24小时"
-    ]
-    
+    # --- 2. 获取数据 (三级保障) ---
     raw_context = ""
+    
+    # A. 尝试主动搜索 (针对传闻和小作文)
+    queries = [
+        "A股 市场小作文 传闻 24小时内 热门",
+        "latest China stock market rumors last 24 hours"
+    ]
     for q in queries:
-        # 直接使用 DDG，简单稳定，避开 search_service 兼容性问题
-        res = await search_with_ddg(q)
+        res = await robust_search(q)
         if res:
-            raw_context += f"\nQuery: {q}\nResults:\n{res[:2500]}\n"
+            raw_context += f"\nQuery: {q}\nResults:\n{res[:2000]}\n"
 
-    logger.info(f"📊 资料长度: {len(raw_context)}")
-    if len(raw_context) < 50:
-        logger.error("❌ 搜索无有效结果")
+    # B. 必须执行：RSS 硬兜底 (确保有权威新闻)
+    # 如果搜索结果太少，或者为了保证权威性，我们强制加载 RSS
+    rss_data = fetch_rss_news()
+    if rss_data:
+        raw_context += f"\n=== AUTHORITATIVE NEWS (RSS) ===\n{rss_data}\n"
+
+    logger.info(f"📊 最终资料长度: {len(raw_context)}")
+    
+    if len(raw_context) < 100:
+        logger.error("❌ 无法获取任何有效新闻 (搜索和RSS均失败)")
         sys.exit(0)
 
     # --- 3. 生成报告 ---
     current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
     
     prompt = f"""
-    You are an expert financial analyst. Analyze the search data below to create a "Morning Market Brief" for {current_date}.
+    You are an expert financial analyst. Create a "Morning Market Brief" for {current_date} based on the data below.
 
-    DATA:
+    DATA SOURCE:
     {raw_context}
 
     INSTRUCTIONS:
-    1. Output PURE HTML code only. No markdown (```html).
+    1. Output PURE HTML code only. NO markdown.
     2. Style: Swiss Design (Minimalist, Grid, Sans-serif).
-    3. Sections:
-       - **🏛️ 权威要闻 (Facts)**: Top 20 verified news (Sina, Reuters, Gov). No speculation.
-       - **🗣️ 市场传闻 (Rumors)**: Top 20 market buzz/rumors. Rank by heat.
+    3. Content:
+       - **🏛️ 权威要闻 (Facts)**: Select 20 verified news items (Prioritize RSS data from Sina/EastMoney).
+       - **🗣️ 市场传闻 (Rumors)**: Select 20 market buzz/rumors (From search data).
     4. Format: One sentence per item. Numbered lists (1-20). Language: Chinese.
-    5. Header: "{current_date} 市场晨报". Footer: "Generated by AI".
+    5. Footer: "Generated by AI Analysis".
     """
 
     logger.info("🧠 AI 正在生成...")
     html_content = ""
 
-    # 独立的 try-except 块，防止语法错误
     try:
         res = None
-        # 兼容各种调用方式
         if hasattr(llm_client, 'chat'):
-            if inspect.iscoroutinefunction(llm_client.chat):
-                res = await llm_client.chat(prompt)
-            else:
-                res = llm_client.chat(prompt)
-        elif hasattr(llm_client, 'analyze'):
-            if inspect.iscoroutinefunction(llm_client.analyze):
-                try: res = await llm_client.analyze(prompt)
-                except: res = await llm_client.analyze("000001", prompt)
-            else:
-                res = llm_client.analyze(prompt)
-        elif hasattr(llm_client, 'generate_content'):
-            res = llm_client.generate_content(prompt).text
+            if inspect.iscoroutinefunction(llm_client.chat): res = await llm_client.chat(prompt)
+            else: res = llm_client.chat(prompt)
         
-        if res:
-            html_content = res if isinstance(res, str) else str(res)
+        if res: html_content = res if isinstance(res, str) else str(res)
             
     except Exception as e:
-        logger.error(f"❌ 生成过程异常: {e}")
-        traceback.print_exc()
+        logger.error(f"❌ 生成异常: {e}")
         sys.exit(0)
 
     if not html_content:
-        logger.error("❌ AI 返回内容为空")
+        logger.error("❌ AI 返回空")
         sys.exit(0)
 
-    # 清洗 Markdown 标记
     html_content = html_content.replace("```html", "").replace("```", "").strip()
 
     # --- 4. 发送邮件 ---
