@@ -2,7 +2,8 @@ import os
 import asyncio
 import logging
 import smtplib
-import json
+import inspect
+import traceback
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -13,131 +14,77 @@ import pytz
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ==================== 1. 动态导入与环境检查 ====================
+# ==================== 1. 万能配置适配器 (核心修复) ====================
+class ConfigAdapter(dict):
+    """
+    将任何配置对象包装成既支持 .key 也支持 ['key'] 和 .get('key') 的万能容器
+    解决 'str object has no attribute get' 或 'Config object is not iterable' 等兼容性问题
+    """
+    def __init__(self, original_config):
+        self._orig = original_config
+        # 尝试将原始配置转换为字典数据
+        data = {}
+        if isinstance(original_config, dict):
+            data = original_config
+        elif hasattr(original_config, '__dict__'):
+            data = vars(original_config)
+        
+        # 初始化字典父类
+        super().__init__(data)
+        # 同时支持属性访问
+        self.__dict__.update(data)
+
+    def __getattr__(self, item):
+        # 优先从字典取，如果没有，尝试从原始对象取
+        val = self.get(item)
+        if val is not None: return val
+        if hasattr(self._orig, item):
+            return getattr(self._orig, item)
+        return None
+
+# ==================== 2. 动态导入 ====================
 try:
     from config import Config
-    # 尝试导入 Tavily (项目依赖中通常有)
-    try:
-        from tavily import TavilyClient
-    except ImportError:
-        TavilyClient = None
-    
-    # 尝试导入 AI 分析器
+    from search_service import SearchService
     import analyzer
+    
+    # 智能查找 Analyzer 类
     LLMAnalyzer = None
+    # 1. 优先找 GeminiAnalyzer
     if hasattr(analyzer, 'GeminiAnalyzer'):
         LLMAnalyzer = getattr(analyzer, 'GeminiAnalyzer')
+    # 2. 其次找 Analyzer
     elif hasattr(analyzer, 'Analyzer'):
         LLMAnalyzer = getattr(analyzer, 'Analyzer')
+    # 3. 暴力查找
     else:
-        # 暴力查找
-        import inspect
         for name, cls in inspect.getmembers(analyzer, inspect.isclass):
             if 'Analyzer' in name and 'Base' not in name:
                 LLMAnalyzer = cls
                 break
+except ImportError:
+    Config = None
+    SearchService = None
+    LLMAnalyzer = None
+    logger.warning("⚠️ 运行在独立模式 (未找到项目模块)")
 
-except ImportError as e:
-    logger.error(f"❌ 依赖导入失败: {e}")
-    exit(1)
-
-# ==================== 2. 独立搜索函数 (直连 API) ====================
-async def direct_search(query):
-    """
-    直接调用 API 搜索，不经过项目内部逻辑封装，防止被过滤
-    """
-    results_text = ""
-    
-    # --- 优先尝试 Tavily (效果最好) ---
-    tavily_key = os.getenv("TAVILY_API_KEYS") or os.getenv("TAVILY_API_KEY")
-    if tavily_key and TavilyClient:
-        try:
-            logger.info("   -> 正在使用 Tavily 直连搜索...")
-            # 处理多个 key 的情况，取第一个
-            if "," in tavily_key: tavily_key = tavily_key.split(",")[0]
-            
-            client = TavilyClient(api_key=tavily_key)
-            # advanced 模式适合搜新闻
-            response = client.search(
-                query=query, 
-                search_depth="advanced", 
-                topic="news", 
-                days=1, 
-                max_results=10
-            )
-            # 解析 Tavily 响应
-            if isinstance(response, dict) and 'results' in response:
-                for item in response['results']:
-                    title = item.get('title', 'No Title')
-                    content = item.get('content', '')
-                    url = item.get('url', '')
-                    results_text += f"- [{title}]({url}): {content}\n"
-            logger.info(f"   -> Tavily 返回了 {len(results_text)} 字符")
-            return results_text
-        except Exception as e:
-            logger.error(f"   -> Tavily 搜索失败: {e}")
-
-    # --- 备选尝试: Bocha (博查) ---
-    bocha_key = os.getenv("BOCHA_API_KEYS")
-    if bocha_key and not results_text:
-        try:
-            logger.info("   -> 正在使用 Bocha 直连搜索...")
-            import requests
-            if "," in bocha_key: bocha_key = bocha_key.split(",")[0]
-            
-            headers = {"Authorization": f"Bearer {bocha_key}", "Content-Type": "application/json"}
-            payload = {"query": query, "freshness": "oneDay", "count": 10}
-            resp = requests.post("https://api.bochaai.com/v1/web-search", json=payload, headers=headers, timeout=10)
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                if 'data' in data and 'webPages' in data['data']:
-                    for item in data['data']['webPages']['value']:
-                        results_text += f"- {item.get('name')} : {item.get('snippet')}\n"
-            logger.info(f"   -> Bocha 返回了 {len(results_text)} 字符")
-            return results_text
-        except Exception as e:
-            logger.error(f"   -> Bocha 搜索失败: {e}")
-
-    return results_text
-
-# ==================== 3. 智能初始化 ====================
-def smart_init(cls, config_obj):
-    try:
-        return cls(config_obj)
-    except:
-        try:
-            # 尝试传 dict
-            cfg_dict = vars(config_obj) if hasattr(config_obj, '__dict__') else {}
-            return cls(cfg_dict)
-        except:
-            return cls()
-
-# ==================== 4. 邮件发送 ====================
+# ==================== 3. 工具函数 ====================
 def send_email_debug(subject, html_content):
     sender = os.getenv('EMAIL_SENDER')
     password = os.getenv('EMAIL_PASSWORD')
     receivers_str = os.getenv('EMAIL_RECEIVERS')
     
     if not sender or not password:
-        logger.error("❌ 未配置邮箱 Secrets (EMAIL_SENDER/EMAIL_PASSWORD)")
+        logger.error("❌ [邮件] 失败: 未配置 EMAIL_SENDER 或 EMAIL_PASSWORD")
         return False
 
-    receivers = receivers_str.split(',') if receivers_str else [sender]
+    receivers = [r.strip() for r in receivers_str.split(',')] if receivers_str else [sender]
     
-    # 自动识别 SMTP
-    smtp_map = {
-        "qq.com": ("smtp.qq.com", 465),
-        "163.com": ("smtp.163.com", 465),
-        "gmail.com": ("smtp.gmail.com", 587),
-        "sina.com": ("smtp.sina.com", 465)
-    }
-    
-    smtp_server, smtp_port = ("smtp.qq.com", 465) # 默认
-    for domain, (server, port) in smtp_map.items():
-        if domain in sender:
-            smtp_server, smtp_port = server, port
-            break
+    # 智能匹配 SMTP
+    smtp_server, smtp_port = "smtp.qq.com", 465
+    if "@163.com" in sender: smtp_server = "smtp.163.com"
+    elif "@gmail.com" in sender: smtp_server, smtp_port = "smtp.gmail.com", 587
+    elif "@sina.com" in sender: smtp_server = "smtp.sina.com"
 
     try:
         msg = MIMEMultipart()
@@ -147,103 +94,174 @@ def send_email_debug(subject, html_content):
         msg.attach(MIMEText(html_content, 'html', 'utf-8'))
 
         if smtp_port == 465:
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port)
+            s = smtplib.SMTP_SSL(smtp_server, smtp_port)
         else:
-            server = smtplib.SMTP(smtp_server, smtp_port)
-            server.starttls()
+            s = smtplib.SMTP(smtp_server, smtp_port)
+            s.starttls()
             
-        server.login(sender, password)
-        server.sendmail(sender, receivers, msg.as_string())
-        server.quit()
-        logger.info(f"✅ 邮件已发送至: {receivers}")
+        s.login(sender, password)
+        s.sendmail(sender, receivers, msg.as_string())
+        s.quit()
+        logger.info("✅ 邮件发送成功")
         return True
     except Exception as e:
-        logger.error(f"❌ 邮件发送失败: {e}")
+        logger.error(f"❌ 邮件发送异常: {e}")
         return False
 
-# ==================== 5. 主程序 ====================
+async def fallback_search(query):
+    """
+    使用 DuckDuckGo 进行免费备用搜索 (增强健壮性)
+    """
+    try:
+        from duckduckgo_search import DDGS
+        logger.info(f"🦆 [备用] DuckDuckGo 搜索: {query[:10]}...")
+        # v4+ 版本 text() 返回的是 list[dict]
+        results = DDGS().text(query, max_results=10)
+        text_res = ""
+        
+        if not results:
+            return ""
+
+        for r in results:
+            # 修复 'str' object has no attribute 'get'
+            if isinstance(r, dict):
+                title = r.get('title', 'No Title')
+                body = r.get('body', r.get('snippet', ''))
+                text_res += f"- Title: {title}\n  Snippet: {body}\n"
+            elif isinstance(r, str):
+                text_res += f"- {r}\n"
+            else:
+                text_res += f"- {str(r)}\n"
+                
+        return text_res
+    except ImportError:
+        logger.error("❌ 未安装 duckduckgo-search")
+        return ""
+    except Exception as e:
+        logger.error(f"❌ DuckDuckGo 搜索失败: {e}")
+        # 打印详细堆栈以便调试
+        logger.error(traceback.format_exc())
+        return ""
+
+def init_analyzer_safely(config_obj):
+    """
+    使用适配器尝试初始化分析器
+    """
+    if LLMAnalyzer is None: return None
+    
+    # 1. 使用万能适配器 (ConfigAdapter)
+    try:
+        adapter = ConfigAdapter(config_obj)
+        return LLMAnalyzer(adapter)
+    except Exception:
+        pass
+        
+    # 2. 尝试原始对象
+    try:
+        return LLMAnalyzer(config_obj)
+    except Exception:
+        pass
+
+    # 3. 尝试空参
+    try:
+        return LLMAnalyzer()
+    except Exception:
+        pass
+        
+    return None
+
+# ==================== 4. 主程序 ====================
 async def generate_morning_brief():
-    logger.info("🚀 启动晨报生成任务...")
+    print("="*50)
+    logger.info("🚀 任务开始")
     
-    # 初始化 AI 分析器
-    cfg = Config()
-    llm = smart_init(LLMAnalyzer, cfg)
+    cfg = Config() if Config else {}
     
-    # 执行搜索 (使用直连模式)
-    queries = [
-        "A股 港股 昨夜今晨 重大财经新闻 政策利好",
-        "China stock market rumors and insider news last 24h",
-        "财联社 证券时报 头条新闻 摘要",
+    # 初始化
+    search_service = None
+    if SearchService:
+        try: search_service = SearchService(ConfigAdapter(cfg))
+        except: 
+            try: search_service = SearchService(cfg)
+            except: pass
+            
+    llm_analyzer = init_analyzer_safely(cfg)
+    
+    if not llm_analyzer:
+        logger.error("❌ 无法初始化 AI 分析器 (Analyzer)，任务终止。")
+        return
+
+    # 搜索
+    search_queries = [
+        "24小时内 中国股市 A股 港股 重大利好利空新闻",
+        "latest China stock market news rumors last 24 hours",
+        "权威财经媒体头条 24小时内 新浪财经 财联社",
     ]
     
     raw_context = ""
-    for q in queries:
-        res = await direct_search(q)
-        if res:
-            raw_context += f"\n=== {q} ===\n{res}\n"
     
-    # 检查搜索结果
-    if len(raw_context) < 50:
-        logger.error("❌ 搜索结果依然过少。原因分析：")
-        logger.error("1. 请检查 GitHub Secrets 中是否配置了 TAVILY_API_KEYS")
-        logger.error("2. 检查 Tavily 是否有额度")
-        logger.error("3. 如果没有 Key，脚本无法获取新闻。")
+    for query in search_queries:
+        logger.info(f"🔍 搜索: {query}")
+        result_text = ""
         
-        # 兜底：如果没有搜索结果，尝试让 AI 仅凭自身知识库生成（虽然不推荐，但比报错好）
-        logger.warning("⚠️ 尝试使用 AI 自身知识库进行兜底生成...")
-        raw_context = "System: Search failed. Please generate a general market outlook based on your internal knowledge cutoff, explicitly stating data might be outdated."
+        # 1. 原项目搜索
+        if search_service:
+            try:
+                res = await search_service.search(query)
+                if res: result_text = str(res)
+            except Exception as e:
+                logger.warning(f"   原项目搜索报错 (正常现象，切换备用): {e}")
 
-    # 生成内容
+        # 2. DuckDuckGo 备用
+        if not result_text or len(result_text) < 50:
+            result_text = await fallback_search(query)
+            
+        if result_text:
+            raw_context += f"\nQuery: {query}\nResults: {result_text[:2000]}\n"
+
+    logger.info(f"📊 搜索资料长度: {len(raw_context)}")
+    
+    if len(raw_context) < 50:
+        logger.error("❌ 资料严重不足，停止生成。")
+        return
+
+    # 生成
     current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
     prompt = f"""
-    You are a professional financial editor. Generate a "Morning Market Brief" for {current_date}.
+    Generate a "Morning Market Brief" for {current_date} based on:
+    {raw_context}
     
-    SOURCE DATA:
-    {raw_context[:10000]} 
-
-    TASK:
-    Create a clean HTML email newsletter.
-    
-    STRUCTURE & CONTENT:
-    1. **Heading**: "{current_date} 市场晨报"
-    2. **Section 1: 🏛️ 市场要闻 (Facts)**
-       - List 15-20 verified news items from the source data.
-       - Focus on regulations, major company moves, and macroeconomics.
-    3. **Section 2: 🗣️ 市场传闻 (Rumors)**
-       - List 15-20 buzz/rumors/speculations ("小作文").
-       - If source data is thin, generalize common market sentiments.
-    
-    STYLE (CRITICAL):
-    - **Format**: RAW HTML only (no markdown code blocks).
-    - **Design**: "Swiss Style" (International Typographic Style).
-    - **CSS**: Use internal <style>. Font: Helvetica/Arial. Minimalist borders. High contrast black/white.
-    - **Items**: Use numbered lists <ol>. One sentence per item.
-    
-    Generate the HTML now.
+    Task:
+    1. Select 20 Facts (Reliable Sources) and 20 Rumors (Market Buzz).
+    2. Format as RAW HTML ONLY (No markdown blocks).
+    3. Style: Swiss Design (Minimalist, Grid, Sans-serif).
+    4. Sections: "🏛️ 市场要闻", "🗣️ 市场传闻".
     """
 
-    logger.info("🧠 正在生成分析报告...")
+    logger.info("🧠 AI 正在生成...")
     try:
-        # 兼容调用
-        if hasattr(llm, 'chat'):
-            content = await llm.chat(prompt)
-        elif hasattr(llm, 'analyze'):
+        html_content = ""
+        # 尝试调用
+        if hasattr(llm_analyzer, 'chat'):
+            html_content = await llm_analyzer.chat(prompt)
+        elif hasattr(llm_analyzer, 'analyze'):
+            # 某些 analyze 可能需要 ticker 参数，做个假参数兼容
             try:
-                content = await llm.analyze(prompt)
-            except:
-                content = await llm.analyze("MARKET_BRIEF", prompt)
+                html_content = await llm_analyzer.analyze(prompt)
+            except TypeError:
+                html_content = await llm_analyzer.analyze("000001", prompt)
+        
+        if html_content:
+            html_content = html_content.replace("```html", "").replace("```", "").strip()
+            subject = f"【市场晨报】{current_date}"
+            send_email_debug(subject, html_content)
         else:
-            logger.error("❌ 无法调用 AI 方法")
-            return
-
-        # 清洗结果
-        content = content.replace("```html", "").replace("```", "").strip()
-        
-        # 发送
-        send_email_debug(f"【市场晨报】{current_date}", content)
-        
+            logger.error("❌ AI 返回空内容")
+            
     except Exception as e:
         logger.error(f"❌ 生成过程异常: {e}")
+        # 打印详细堆栈，这行能帮你看到到底是哪行代码出的错
+        logger.error(traceback.format_exc())
 
 if __name__ == "__main__":
     asyncio.run(generate_morning_brief())
