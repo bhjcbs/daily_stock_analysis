@@ -17,7 +17,7 @@ import pytz
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ==================== 0. 自动依赖检查 ====================
+# ==================== 0. 基础环境检查 ====================
 def install_package(package):
     try:
         logger.info(f"🔧 自动安装依赖: {package}...")
@@ -25,6 +25,7 @@ def install_package(package):
     except Exception as e:
         logger.warning(f"❌ 安装 {package} 失败: {e}")
 
+# 检查必要库
 try:
     import duckduckgo_search
 except ImportError:
@@ -36,29 +37,30 @@ except ImportError:
     install_package("google-generativeai")
     import google.generativeai as genai
 
-# ==================== 1. 内置独立 Gemini 客户端 ====================
+# ==================== 1. 独立 Gemini 客户端 (兜底) ====================
 class DirectGeminiClient:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            # 尝试从参数或 env 文件读取，或者直接报错
-            raise ValueError("未配置 GEMINI_API_KEY")
+            raise ValueError("环境变量 GEMINI_API_KEY 未配置")
         
         genai.configure(api_key=api_key)
+        # 尝试使用 flash 模型，速度快且适合长文本
         self.model = genai.GenerativeModel('gemini-1.5-flash')
-        logger.info("💎 [独立模式] Gemini 客户端初始化成功")
+        logger.info("💎 [独立模式] Gemini 客户端就绪")
 
     async def chat(self, prompt):
         try:
-            # generate_content 是同步的，但在 asyncio 中通常可以接受
+            # 同步方法在异步中通常也能运行，除非并发极高
             response = self.model.generate_content(prompt)
             return response.text
         except Exception as e:
-            logger.error(f"❌ Gemini API 错误: {e}")
+            logger.error(f"❌ Gemini API 调用失败: {e}")
             return None
 
-# ==================== 2. 万能配置适配器 ====================
+# ==================== 2. 配置适配器 ====================
 class ConfigAdapter(dict):
+    """兼容字典和对象属性访问"""
     def __init__(self, original_config):
         self._orig = original_config
         data = {}
@@ -81,12 +83,12 @@ def send_email_standalone(subject, html_content):
     receivers_str = os.getenv('EMAIL_RECEIVERS')
     
     if not sender or not password:
-        logger.error("❌ 邮件发送失败: 环境变量缺失")
+        logger.error("❌ 邮件失败: 缺少发件人或密码环境变量")
         return False
 
     receivers = [r.strip() for r in receivers_str.split(',')] if receivers_str else [sender]
     
-    # 智能匹配 SMTP
+    # 简单的 SMTP 策略
     smtp_server, smtp_port = "smtp.qq.com", 465
     if "@163.com" in sender: smtp_server = "smtp.163.com"
     elif "@gmail.com" in sender: smtp_server, smtp_port = "smtp.gmail.com", 587
@@ -112,16 +114,21 @@ def send_email_standalone(subject, html_content):
         return False
 
 # ==================== 4. 搜索模块 ====================
-async def fallback_search_ddg(query):
+async def search_with_ddg(query):
+    """使用 DuckDuckGo 搜索"""
     try:
         from duckduckgo_search import DDGS
-        logger.info(f"🦆 [DDG] 搜索: {query[:10]}...")
+        logger.info(f"🦆 [DDG] 搜索: {query[:15]}...")
+        # 增加 max_results 以获取更多信息
         results = DDGS().text(query, max_results=20)
         text_res = ""
         if not results: return ""
+        
         for r in results:
             if isinstance(r, dict):
-                text_res += f"Src: {r.get('title','?')}\nTxt: {r.get('body', r.get('snippet',''))}\n---\n"
+                title = r.get('title', '?')
+                body = r.get('body', r.get('snippet', ''))
+                text_res += f"Src: {title}\nTxt: {body}\n---\n"
             else:
                 text_res += f"{str(r)}\n---\n"
         return text_res
@@ -132,33 +139,37 @@ async def fallback_search_ddg(query):
 # ==================== 5. 主程序 ====================
 async def generate_morning_brief():
     print("="*60)
-    logger.info("🚀 任务启动")
+    logger.info("🚀 每日早报任务启动")
     
-    # --- 1. 准备 AI 客户端 ---
+    # --- 1. 初始化 AI ---
     llm_client = None
-    # 尝试加载项目原有代码
+    
+    # 尝试加载项目原有代码 (A计划)
     try:
         from config import Config
         import analyzer
         cfg = Config() if Config else {}
+        adapter = ConfigAdapter(cfg)
+        
         # 寻找 Analyzer 类
         AnalyzerCls = None
-        for name in ['GeminiAnalyzer', 'GoogleGeminiAnalyzer', 'Analyzer']:
+        candidates = ['GeminiAnalyzer', 'GoogleGeminiAnalyzer', 'Analyzer']
+        for name in candidates:
             if hasattr(analyzer, name):
-                AnalyzerCls = getattr(analyzer, name)
-                break
+                AnalyzerCls = getattr(analyzer, name); break
+        
         if not AnalyzerCls:
              for name, cls in inspect.getmembers(analyzer, inspect.isclass):
                 if 'Analyzer' in name: AnalyzerCls = cls; break
         
         if AnalyzerCls:
-            try: llm_client = AnalyzerCls(ConfigAdapter(cfg))
+            try: llm_client = AnalyzerCls(adapter)
             except: llm_client = AnalyzerCls(cfg)
-            logger.info("✅ 使用项目原生 AI 分析器")
+            logger.info("✅ 已加载项目原生 AI 分析器")
     except Exception as e:
         logger.warning(f"⚠️ 项目模块加载受限: {e}")
 
-    # 兜底：使用独立 Gemini 客户端
+    # 独立 Gemini 客户端 (B计划)
     if not llm_client:
         try:
             llm_client = DirectGeminiClient()
@@ -176,59 +187,42 @@ async def generate_morning_brief():
     
     raw_context = ""
     for q in queries:
-        # 这里简化逻辑，直接使用稳定的 DDG，避免项目 SearchService 的兼容性地狱
-        # 除非确定项目 SearchService 可用，否则 DDG 足够且更稳定
-        res = await fallback_search_ddg(q)
+        # 直接使用 DDG，简单稳定，避开 search_service 兼容性问题
+        res = await search_with_ddg(q)
         if res:
-            raw_context += f"\nQuery: {q}\nResults:\n{res[:3000]}\n"
+            raw_context += f"\nQuery: {q}\nResults:\n{res[:2500]}\n"
 
     logger.info(f"📊 资料长度: {len(raw_context)}")
     if len(raw_context) < 50:
-        logger.error("❌ 搜索无结果")
+        logger.error("❌ 搜索无有效结果")
         sys.exit(0)
 
     # --- 3. 生成报告 ---
     current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
+    
     prompt = f"""
-    You are an expert financial analyst. Analyze the provided search data to create a "Morning Market Brief" for {current_date}.
+    You are an expert financial analyst. Analyze the search data below to create a "Morning Market Brief" for {current_date}.
 
-    SOURCE DATA:
+    DATA:
     {raw_context}
 
     INSTRUCTIONS:
-    1. **Format**: Output PURE HTML code. "Swiss Style" design (Minimalist, Grid, Sans-serif).
-       - NO Markdown code blocks (do not start with ```html).
-       - Include internal CSS for clean styling.
-    
-    2. **Content Extraction**:
-       - **Section 1: 🏛️ 权威要闻 (Market Facts)**
-         - Select 20 verified news items from reliable sources (Gov, Sina, Reuters).
-         - Focus on facts, policy, and earnings.
-       - **Section 2: 🗣️ 市场传闻 (Market Rumors)**
-         - Select 20 unverified rumors ("Little Compositions", market buzz).
-         - Rank by discussion heat.
-    
-    3. **Writing Style**:
-       - NO TITLES for items.
-       - One sentence summary per item.
-       - Language: Chinese (Simplified).
-       - Numbered lists (1-20).
-
-    4. **Structure**:
-       - Header: "{current_date} 市场晨报"
-       - Section 1 (Facts)
-       - Section 2 (Rumors)
-       - Footer: "Generated by AI Analysis"
-
-    Generate the HTML now.
+    1. Output PURE HTML code only. No markdown (```html).
+    2. Style: Swiss Design (Minimalist, Grid, Sans-serif).
+    3. Sections:
+       - **🏛️ 权威要闻 (Facts)**: Top 20 verified news (Sina, Reuters, Gov). No speculation.
+       - **🗣️ 市场传闻 (Rumors)**: Top 20 market buzz/rumors. Rank by heat.
+    4. Format: One sentence per item. Numbered lists (1-20). Language: Chinese.
+    5. Header: "{current_date} 市场晨报". Footer: "Generated by AI".
     """
 
     logger.info("🧠 AI 正在生成...")
     html_content = ""
-    
-    # 独立的 try-except 块处理 AI 生成，防止语法错误
+
+    # 独立的 try-except 块，防止语法错误
     try:
         res = None
+        # 兼容各种调用方式
         if hasattr(llm_client, 'chat'):
             if inspect.iscoroutinefunction(llm_client.chat):
                 res = await llm_client.chat(prompt)
@@ -240,15 +234,14 @@ async def generate_morning_brief():
                 except: res = await llm_client.analyze("000001", prompt)
             else:
                 res = llm_client.analyze(prompt)
-        elif hasattr(llm_client, 'generate_content'): # 原生 model 对象
+        elif hasattr(llm_client, 'generate_content'):
             res = llm_client.generate_content(prompt).text
         
-        # 统一处理结果
         if res:
             html_content = res if isinstance(res, str) else str(res)
             
     except Exception as e:
-        logger.error(f"❌ 生成失败: {e}")
+        logger.error(f"❌ 生成过程异常: {e}")
         traceback.print_exc()
         sys.exit(0)
 
@@ -256,13 +249,13 @@ async def generate_morning_brief():
         logger.error("❌ AI 返回内容为空")
         sys.exit(0)
 
-    # 清洗
+    # 清洗 Markdown 标记
     html_content = html_content.replace("```html", "").replace("```", "").strip()
 
-    # --- 4. 发送 ---
+    # --- 4. 发送邮件 ---
     subject = f"【市场晨报】{current_date}"
     if send_email_standalone(subject, html_content):
-        logger.info("🎉 流程结束")
+        logger.info("🎉 任务完成")
     else:
         logger.warning("⚠️ 邮件发送失败")
 
