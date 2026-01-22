@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import smtplib
+import traceback
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -12,183 +13,179 @@ import pytz
 try:
     from config import Config
     from search_service import SearchService
-    # 尝试导入 AI 分析器，如果类名不同可能需要调整，通常是 Analyzer 或 GeminiAnalyzer
-    # 这里我们尝试从 analyzer 导入 Analyzer，如果失败则尝试通用导入
     try:
         from analyzer import Analyzer as LLMAnalyzer 
     except ImportError:
         try:
             from analyzer import GeminiAnalyzer as LLMAnalyzer
         except ImportError:
-            # 如果都找不到，稍后会报错，提示用户检查 analyzer.py
-            from analyzer import * # 假设默认导出的类可以直接用，或者这里需要用户手动确认类名
-            pass
+            # 最后的尝试：导入 analyzer 模块中的任意 Analyzer 类
+            import analyzer
+            import inspect
+            clsmembers = inspect.getmembers(analyzer, inspect.isclass)
+            # 找名字里带 Analyzer 的类
+            found = False
+            for name, cls in clsmembers:
+                if 'Analyzer' in name and 'Base' not in name:
+                    LLMAnalyzer = cls
+                    found = True
+                    break
+            if not found:
+                raise ImportError("无法找到 Analyzer 类")
 except ImportError as e:
     print(f"❌ 导入项目模块失败: {e}")
-    print("请确保 news_digest.py 位于项目根目录")
     exit(1)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def send_email_standalone(subject, html_content):
+def send_email_debug(subject, html_content):
     """
-    独立邮件发送函数，不依赖项目原有的 notification.py
+    带详细调试信息的邮件发送函数
     """
     sender = os.getenv('EMAIL_SENDER')
-    password = os.getenv('EMAIL_PASSWORD') # 授权码
+    password = os.getenv('EMAIL_PASSWORD')
     receivers_str = os.getenv('EMAIL_RECEIVERS')
     
-    if not (sender and password):
-        logger.warning("⚠️ 未配置 EMAIL_SENDER 或 EMAIL_PASSWORD，跳过发送邮件。")
-        return
+    logger.info("📧 [邮件调试] 准备发送邮件...")
+    logger.info(f"   - 发件人: {sender}")
+    logger.info(f"   - 收件人设置: {receivers_str}")
+    
+    if not sender or not password:
+        logger.error("❌ [邮件调试] 失败: 环境变量 EMAIL_SENDER 或 EMAIL_PASSWORD 为空！")
+        return False
 
-    # 如果没有配置收件人，默认发给自己
     if not receivers_str:
         receivers = [sender]
+        logger.info("   - 未指定收件人，默认发给发件人自己")
     else:
-        receivers = receivers_str.split(',')
+        receivers = [r.strip() for r in receivers_str.split(',')]
 
     # 智能匹配 SMTP 服务器
-    smtp_server = "smtp.qq.com" # 默认 QQ
-    smtp_port = 465 # 默认 SSL 端口
+    smtp_server = "smtp.qq.com"
+    smtp_port = 465 # SSL
     
     if "@163.com" in sender:
         smtp_server = "smtp.163.com"
     elif "@gmail.com" in sender:
         smtp_server = "smtp.gmail.com"
+        smtp_port = 587 # Gmail 通常用 TLS
     elif "@sina.com" in sender:
         smtp_server = "smtp.sina.com"
     
-    logger.info(f"正在通过 {smtp_server} 发送邮件给 {len(receivers)} 人...")
+    logger.info(f"   - SMTP服务器: {smtp_server}:{smtp_port}")
 
     try:
         message = MIMEMultipart()
         message['From'] = Header(sender, 'utf-8')
         message['To'] = Header(",".join(receivers), 'utf-8')
         message['Subject'] = Header(subject, 'utf-8')
-        
         message.attach(MIMEText(html_content, 'html', 'utf-8'))
 
-        # 连接服务器
-        try:
-            server = smtplib.SMTP_SSL(smtp_server, 465)
-        except Exception:
-            # 如果 SSL 失败，尝试 TLS
-            server = smtplib.SMTP(smtp_server, 587)
+        logger.info("   - 正在连接 SMTP 服务器...")
+        if smtp_port == 465:
+            server = smtplib.SMTP_SSL(smtp_server, smtp_port)
+        else:
+            server = smtplib.SMTP(smtp_server, smtp_port)
             server.starttls()
-            
+        
+        logger.info("   - 正在登录...")
         server.login(sender, password)
+        
+        logger.info("   - 正在发送数据...")
         server.sendmail(sender, receivers, message.as_string())
         server.quit()
-        logger.info("✅ 邮件发送成功！")
+        logger.info("✅ [邮件调试] 邮件发送成功！请检查收件箱和垃圾箱。")
+        return True
+    except smtplib.SMTPAuthenticationError:
+        logger.error("❌ [邮件调试] 认证失败：请检查邮箱授权码（不是登录密码）是否正确，或是否开启了 SMTP 服务。")
     except Exception as e:
-        logger.error(f"❌ 邮件发送失败: {e}")
+        logger.error(f"❌ [邮件调试] 发送异常: {e}")
+        traceback.print_exc()
+    return False
 
 async def generate_morning_brief():
-    logger.info("🚀 开始执行每日市场晨报任务...")
+    print("="*50)
+    logger.info("🚀 任务开始")
     
-    # 1. 初始化服务
+    # 1. 初始化
     try:
         cfg = Config()
         search_service = SearchService(cfg)
-        
-        # 尝试初始化分析器，这里假设类名为 Analyzer，如果原来的 analyzer.py 里类名不同，
-        # 请打开 analyzer.py 查看 class 定义的名字并在此修改
-        # 根据常见习惯，通常是 Analyzer(cfg) 或 GeminiAnalyzer(cfg)
-        try:
-            llm_analyzer = LLMAnalyzer(cfg)
-        except NameError:
-             # 如果上面 import 没搞定，尝试直接实例化 analyzer 里的第一个类（盲猜）
-             import analyzer
-             cls_name = [x for x in dir(analyzer) if 'Analyzer' in x and 'Base' not in x][0]
-             LLMAnalyzerClass = getattr(analyzer, cls_name)
-             llm_analyzer = LLMAnalyzerClass(cfg)
-
+        llm_analyzer = LLMAnalyzer(cfg)
+        logger.info("✅ 服务初始化完成")
     except Exception as e:
-        logger.error(f"初始化服务失败: {e}")
+        logger.error(f"❌ 初始化失败: {e}")
         return
-    
-    # 2. 执行搜索
-    # 针对 24小时内的新闻和传闻
+
+    # 2. 搜索
     search_queries = [
         "24小时内 中国股市 A股 港股 重大利好利空新闻",
         "latest China stock market news rumors last 24 hours",
-        "A股 市场传闻 小作文 24小时内",
         "权威财经媒体头条 24小时内 新浪财经 财联社",
     ]
     
-    logger.info("🔍 正在全网搜索最新情报...")
+    logger.info("🔍 开始搜索...")
     raw_context = ""
     for query in search_queries:
         try:
-            # 兼容不同的 search 方法签名
-            # 如果 search_service.search 只需要 query
+            # 尝试调用 search
             results = await search_service.search(query)
-            raw_context += f"\nSearch Query: {query}\nResults: {results}\n"
+            # 简单检查结果是否有效
+            if results:
+                raw_context += f"\nQuery: {query}\nResults: {str(results)[:2000]}...\n" # 截断防止日志过长
         except Exception as e:
-            logger.warning(f"搜索关键词 '{query}' 时出错 (可能是API限制): {e}")
-            continue
+            logger.warning(f"   - 搜索 '{query}' 失败: {e}")
 
+    logger.info(f"   - 搜索数据长度: {len(raw_context)} 字符")
     if len(raw_context) < 100:
-        logger.error("❌ 搜索结果过少，无法生成报告。")
+        logger.error("❌ 搜索结果过少，停止生成。可能原因：API 额度耗尽或网络问题。")
         return
 
-    # 3. 构建 Prompt
+    # 3. AI 生成
     current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
-    
     prompt = f"""
-    You are a senior financial analyst. Based on the searched news below, generate a "Morning Market Brief" for {current_date}.
-    
-    SEARCH CONTEXT:
+    Generate a "Morning Market Brief" for {current_date} based on:
     {raw_context}
-
-    INSTRUCTIONS:
-    1. **Filter**: Select top 20 verified news (Facts) and top 20 market rumors/buzz (Rumors).
-    2. **Format**: OUTPUT RAW HTML ONLY. No markdown blocks.
-    3. **Style**: "International Typographic Style" (Swiss Style). 
-       - Sans-serif fonts (Helvetica/Arial).
-       - High contrast.
-       - Grid-based layout.
-       - Use an internal <style> block to make it look professional in email clients.
     
-    CONTENT STRUCTURE:
-    - **Header**: "{current_date} 市场晨报" (Big, Bold).
-    - **Section 1**: 🏛️ 市场要闻 (Reliable sources like Reuters, Sina, etc).
-    - **Section 2**: 🗣️ 市场传闻 (Unverified buzz, "Little Compositions").
-    - **Footer**: Generated by AI.
-
-    Create the HTML now.
+    Required:
+    - 20 Facts (Reliable Sources)
+    - 20 Rumors (Market Buzz)
+    - Output RAW HTML code only (No markdown blocks).
+    - Style: Swiss Design (Minimalist, Grid, Sans-serif).
     """
 
-    logger.info("🧠 正在调用 AI 生成分析报告...")
+    logger.info("🧠 正在生成内容 (这可能需要 30 秒)...")
+    html_content = ""
     try:
-        # 调用 AI，假设方法名为 analyze 或 chat
-        # 大部分 analyzer 类都有 chat 或 generate 方法
+        # 兼容性调用
         if hasattr(llm_analyzer, 'chat'):
             html_content = await llm_analyzer.chat(prompt)
         elif hasattr(llm_analyzer, 'analyze'):
-            # analyze 通常需要 ticker，我们这里直接传 prompt 试试，或者看源码
-            # 为了保险，我们尝试直接调用 LLM 接口如果 analyzer 封装太死
-            html_content = await llm_analyzer.chat(prompt) # 赌它是 chat
+            html_content = await llm_analyzer.analyze(prompt)
         else:
-            # 如果找不到方法，打印所有方法名供调试
-            methods = [func for func in dir(llm_analyzer) if callable(getattr(llm_analyzer, func)) and not func.startswith("__")]
-            logger.error(f"Analyzer 类中找不到 'chat' 方法。可用方法: {methods}")
-            return
-
-        # 清理 Markdown
-        html_content = html_content.replace("```html", "").replace("```", "").strip()
-
-        # 4. 发送邮件
-        subject = f"【市场晨报】{current_date} A股/港股 每日速递"
-        send_email_standalone(subject, html_content)
-        
+             logger.error("❌ 无法找到 AI 分析方法 (chat 或 analyze)")
+             return
     except Exception as e:
-        logger.error(f"生成或发送过程中出错: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"❌ AI 生成失败: {e}")
+        return
+
+    if not html_content:
+        logger.error("❌ AI 返回内容为空")
+        return
+        
+    html_content = html_content.replace("```html", "").replace("```", "").strip()
+    logger.info(f"✅ 内容生成成功 (长度: {len(html_content)})")
+
+    # 4. 发送邮件
+    subject = f"【市场晨报】{current_date}"
+    success = send_email_debug(subject, html_content)
+
+    if not success:
+        print("\n" + "!"*20 + " 邮件发送失败，备份内容如下 " + "!"*20)
+        print(html_content)
+        print("!"*60 + "\n")
 
 if __name__ == "__main__":
     asyncio.run(generate_morning_brief())
