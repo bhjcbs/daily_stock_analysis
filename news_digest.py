@@ -20,20 +20,51 @@ logger = logging.getLogger(__name__)
 # ==================== 0. 自动依赖检查 ====================
 def install_package(package):
     try:
-        logger.info(f"🔧 [Gemini优先] 检测到缺失库 {package}，正在自动安装...")
+        logger.info(f"🔧 正在自动安装依赖: {package}...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", package])
         logger.info(f"✅ {package} 安装成功")
     except Exception as e:
-        logger.warning(f"❌ 自动安装失败: {e}")
+        logger.warning(f"❌ 安装 {package} 失败: {e}")
 
+# 检查必要的库
 try:
     import duckduckgo_search
 except ImportError:
     install_package("duckduckgo-search")
 
-# ==================== 1. 万能配置适配器 ====================
+try:
+    import google.generativeai as genai
+except ImportError:
+    install_package("google-generativeai")
+    import google.generativeai as genai
+
+# ==================== 1. 内置独立 Gemini 客户端 (兜底神器) ====================
+class DirectGeminiClient:
+    """
+    当原项目分析器无法加载时，直接使用此客户端连接 Gemini。
+    不依赖项目任何文件，只要有 API Key 就能跑。
+    """
+    def __init__(self):
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("未找到 GEMINI_API_KEY 环境变量")
+        
+        genai.configure(api_key=api_key)
+        # 优先尝试新版 Flash 模型，速度快效果好
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        logger.info("💎 [独立模式] 已初始化内置 Gemini 客户端 (gemini-1.5-flash)")
+
+    async def chat(self, prompt):
+        try:
+            # 这里的 generate_content 是同步调用，但在 async 函数中没问题
+            response = self.model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            logger.error(f"❌ Gemini API 调用失败: {e}")
+            return None
+
+# ==================== 2. 万能配置适配器 ====================
 class ConfigAdapter(dict):
-    """将配置对象转换为通用格式"""
     def __init__(self, original_config):
         self._orig = original_config
         data = {}
@@ -43,59 +74,42 @@ class ConfigAdapter(dict):
             data = original_config.dict()
         elif hasattr(original_config, '__dict__'):
             data = vars(original_config)
-        
         super().__init__(data)
         self.__dict__.update(data)
 
     def __getattr__(self, item):
         val = self.get(item)
         if val is not None: return val
-        if hasattr(self._orig, item):
-            return getattr(self._orig, item)
+        if hasattr(self._orig, item): return getattr(self._orig, item)
         return None
 
-# ==================== 2. 动态加载 (强制 Gemini 3 优先) ====================
+# ==================== 3. 动态加载项目模块 ====================
 try:
     from config import Config
     from search_service import SearchService
     import analyzer
     
-    # 智能查找 AI 分析器类
-    LLMAnalyzer = None
-    
-    # [优先策略] 显式寻找 Gemini 相关类
-    gemini_candidates = ['GeminiAnalyzer', 'GoogleGeminiAnalyzer', 'GeminiProAnalyzer']
-    other_candidates = ['Analyzer', 'StockAnalyzer']
-    
-    # 1. 优先尝试 Gemini
-    for name in gemini_candidates:
+    # 尝试查找项目中的 Analyzer 类
+    ProjectAnalyzerClass = None
+    candidates = ['GeminiAnalyzer', 'GoogleGeminiAnalyzer', 'Analyzer', 'StockAnalyzer']
+    for name in candidates:
         if hasattr(analyzer, name):
-            LLMAnalyzer = getattr(analyzer, name)
-            logger.info(f"💎 已锁定 Gemini 分析器: {name}")
+            ProjectAnalyzerClass = getattr(analyzer, name)
             break
             
-    # 2. 如果没有 Gemini，才尝试其他
-    if LLMAnalyzer is None:
-        for name in other_candidates:
-            if hasattr(analyzer, name):
-                LLMAnalyzer = getattr(analyzer, name)
-                logger.info(f"⚠️ 未找到 Gemini 专用类，降级使用: {name}")
-                break
-    
-    # 3. 最后的兜底
-    if LLMAnalyzer is None:
+    if ProjectAnalyzerClass is None:
+        # 扫描所有类
         for name, cls in inspect.getmembers(analyzer, inspect.isclass):
             if 'Analyzer' in name and 'Base' not in name:
-                LLMAnalyzer = cls
+                ProjectAnalyzerClass = cls
                 break
-
 except ImportError:
     Config = None
     SearchService = None
-    LLMAnalyzer = None
-    logger.warning("⚠️ 未找到项目核心模块，进入备用模式。")
+    ProjectAnalyzerClass = None
+    logger.warning("⚠️ 未找到项目核心模块，将使用纯独立模式运行。")
 
-# ==================== 3. 独立邮件发送 ====================
+# ==================== 4. 邮件发送模块 ====================
 def send_email_standalone(subject, html_content):
     sender = os.getenv('EMAIL_SENDER')
     password = os.getenv('EMAIL_PASSWORD')
@@ -117,7 +131,7 @@ def send_email_standalone(subject, html_content):
 
     try:
         msg = MIMEMultipart()
-        msg['From'] = Header(f"Daily Stock Analysis <{sender}>", 'utf-8')
+        msg['From'] = Header(f"Daily Market Brief <{sender}>", 'utf-8')
         msg['To'] = Header(",".join(receivers), 'utf-8')
         msg['Subject'] = Header(subject, 'utf-8')
         msg.attach(MIMEText(html_content, 'html', 'utf-8'))
@@ -131,20 +145,19 @@ def send_email_standalone(subject, html_content):
         server.login(sender, password)
         server.sendmail(sender, receivers, msg.as_string())
         server.quit()
-        logger.info(f"✅ 邮件已发送给: {len(receivers)} 位收件人")
+        logger.info(f"✅ 邮件发送成功 ({len(receivers)} 人)")
         return True
     except Exception as e:
         logger.error(f"❌ 邮件发送异常: {e}")
         return False
 
-# ==================== 4. 搜索功能 (智能侦测) ====================
+# ==================== 5. 搜索功能 (混合模式) ====================
 async def fallback_search_ddg(query):
-    """DuckDuckGo 备用搜索"""
     try:
         from duckduckgo_search import DDGS
-        logger.info(f"🦆 [备用] 调用 DuckDuckGo 搜索: {query[:10]}...")
-        results = DDGS().text(query, max_results=25)
-        
+        logger.info(f"🦆 [DuckDuckGo] 搜索: {query[:15]}...")
+        # 尝试使用 v4+ 新版 API
+        results = DDGS().text(query, max_results=20)
         text_res = ""
         if not results: return ""
         
@@ -161,160 +174,137 @@ async def fallback_search_ddg(query):
         return ""
 
 async def smart_project_search(service, query):
-    """
-    自动侦测 SearchService 的正确方法名
-    优先寻找可能利用 AI 增强的搜索方法
-    """
-    # 优先级列表：优先尝试可能包含 'gemini' 或 'smart' 的方法，然后是标准方法
-    possible_methods = ['search_with_gemini', 'smart_search', 'search_news', 'search', 'query', 'fetch', 'run']
-    
+    """尝试调用项目原有的搜索功能"""
+    possible_methods = ['search', 'search_news', 'query', 'fetch', 'get_news', 'run']
     for method in possible_methods:
         if hasattr(service, method):
             func = getattr(service, method)
             if callable(func):
                 try:
-                    logger.info(f"👉 [Gemini流程] 尝试调用项目搜索方法: {method}")
-                    try:
-                        res = func(query)
-                    except TypeError:
-                        res = func(query, 10) 
+                    logger.info(f"👉 [项目内置] 尝试调用 {method}...")
+                    try: res = func(query)
+                    except TypeError: res = func(query, 10)
                     
-                    if inspect.iscoroutine(res):
-                        res = await res
-                    
+                    if inspect.iscoroutine(res): res = await res
                     if res: return str(res)
                 except Exception as e:
                     logger.warning(f"   调用 {method} 失败: {e}")
-                    continue
     return None
 
-# ==================== 5. 主流程 ====================
+# ==================== 6. 主程序 ====================
 async def generate_morning_brief():
     print("="*60)
-    logger.info("🚀 [每日早报] 任务启动 (Gemini 3 Enhanced)")
+    logger.info("🚀 每日早报任务启动")
     
-    # --- 初始化 ---
-    cfg = Config() if Config else {}
-    wrapped_cfg = ConfigAdapter(cfg)
+    # 1. 初始化 AI 分析器 (双重保障)
+    llm_client = None
     
-    search_service = None
-    llm_analyzer = None
+    # A计划：尝试加载项目原有的 Analyzer
+    if ProjectAnalyzerClass:
+        try:
+            cfg = Config() if Config else {}
+            wrapped_cfg = ConfigAdapter(cfg)
+            try: llm_client = ProjectAnalyzerClass(wrapped_cfg)
+            except: llm_client = ProjectAnalyzerClass(cfg)
+            logger.info("✅ 成功加载项目原有 AI 分析器")
+        except Exception as e:
+            logger.warning(f"⚠️ 项目 Analyzer 加载失败 ({e})，切换到 B 计划...")
+    
+    # B计划：加载内置独立 Gemini 客户端
+    if not llm_client:
+        try:
+            llm_client = DirectGeminiClient()
+        except Exception as e:
+            logger.error(f"❌ 致命错误: 无法初始化任何 AI 客户端。原因: {e}")
+            logger.error("👉 请检查 GitHub Secrets 中是否配置了 GEMINI_API_KEY")
+            sys.exit(0)
 
-    if SearchService:
-        try: search_service = SearchService(wrapped_cfg)
-        except: 
-            try: search_service = SearchService(cfg)
-            except: pass
-            
-    if LLMAnalyzer:
-        try: llm_analyzer = LLMAnalyzer(wrapped_cfg)
-        except: 
-            try: llm_analyzer = LLMAnalyzer(cfg)
-            except: pass
-            
-    if not llm_analyzer:
-        logger.error("❌ 无法初始化 AI 分析器，任务终止。")
-        sys.exit(0)
-
-    # --- 执行搜索 ---
+    # 2. 执行搜索
+    # 搜索词旨在覆盖 24小时内的“事实”与“传闻”
     queries = [
         "过去24小时 中国股市 A股 港股 重大财经新闻 利好利空",
-        "latest Chinese stock market rumors and insider news last 24 hours",
+        "latest China stock market rumors and insider news last 24 hours",
         "A股 市场小作文 传闻 24小时内 热门",
         "新浪财经 东方财富 财联社 头条新闻 24小时"
     ]
     
     raw_context = ""
-    logger.info("🔍 开始全网搜索 (优先使用项目内置源)...")
     
+    # 初始化搜索服务 (如果有)
+    project_search = None
+    if SearchService:
+        try:
+            cfg = Config() if Config else {}
+            project_search = SearchService(ConfigAdapter(cfg))
+        except: pass
+
     for q in queries:
         res_text = ""
-        # 1. 优先尝试项目自带搜索
-        if search_service:
-            res_text = await smart_project_search(search_service, q)
+        # 优先用项目搜索
+        if project_search:
+            res_text = await smart_project_search(project_search, q)
         
-        # 2. 备用
+        # 兜底用 DDG
         if not res_text or len(res_text) < 100:
             res_text = await fallback_search_ddg(q)
             
         if res_text:
             raw_context += f"\nQuery: {q}\nResults:\n{res_text[:3000]}\n"
 
-    logger.info(f"📊 获取资料总长度: {len(raw_context)}")
+    logger.info(f"📊 资料总长度: {len(raw_context)}")
     
     if len(raw_context) < 100:
-        logger.error("❌ 未获取到有效数据，停止生成。")
+        logger.error("❌ 搜索无结果，停止生成。")
         sys.exit(0)
 
-    # --- AI 分析与生成 (Gemini 3 Prompt) ---
+    # 3. 生成报告
     current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
     
-    # 针对 Gemini 3 优化的 Prompt
     prompt = f"""
-    You are an expert financial analyst using the Gemini 3 model capabilities. 
-    Analyze the raw search data below to create a "Daily Stock Analysis - Morning Brief" for {current_date}.
+    You are an expert financial analyst. Analyze the provided search data to create a "Morning Market Brief" for {current_date}.
 
     SOURCE DATA:
     {raw_context}
 
     INSTRUCTIONS:
     1. **Format**: Output PURE HTML code. "Swiss Style" design (Minimalist, Grid, Sans-serif).
-       - NO Markdown code blocks.
-       - Include internal CSS.
+       - NO Markdown code blocks (do not start with ```html).
+       - Include internal CSS for clean styling.
     
-    2. **Content Extraction (Gemini Reasoning)**:
+    2. **Content Extraction**:
        - **Section 1: 🏛️ 权威要闻 (Market Facts)**
-         - Filter for the 20 MOST IMPACTFUL news items from reliable sources (Gov, Sina, Reuters).
-         - Focus on policy changes, earnings, and major market moves.
-         - NO speculation.
+         - Select 20 verified news items from reliable sources (Gov, Sina, Reuters).
+         - Focus on facts, policy, and earnings.
        - **Section 2: 🗣️ 市场传闻 (Market Rumors)**
-         - Filter for the 20 HOTTEST market rumors ("Little Compositions", unverified buzz) currently driving sentiment.
-         - Rank by heat/controversy.
+         - Select 20 unverified rumors ("Little Compositions", market buzz).
+         - Rank by discussion heat.
     
     3. **Writing Style**:
-       - NO TITLES. One sentence summary per item.
+       - NO TITLES for items.
+       - One sentence summary per item.
        - Language: Chinese (Simplified).
        - Numbered lists (1-20).
 
     4. **Structure**:
-       - Header: "{current_date} 市场晨报 (Powered by Gemini 3)"
+       - Header: "{current_date} 市场晨报"
        - Section 1 (Facts)
        - Section 2 (Rumors)
-       - Footer: "Generated by Daily Stock Analysis AI"
+       - Footer: "Generated by AI Analysis"
 
     Generate the HTML now.
     """
 
-    logger.info("🧠 Gemini 3 正在分析并撰写报告...")
+    logger.info("🧠 AI 正在生成报告...")
     html_content = ""
     try:
-        # 尝试调用 chat 或 analyze
-        if hasattr(llm_analyzer, 'chat'):
-            html_content = await llm_analyzer.chat(prompt)
-        elif hasattr(llm_analyzer, 'analyze'):
-            try: html_content = await llm_analyzer.analyze(prompt)
-            except: html_content = await llm_analyzer.analyze("000001", prompt)
-        
-        if not html_content:
-            logger.error("❌ AI 返回内容为空")
-            sys.exit(0)
-
-        html_content = html_content.replace("```html", "").replace("```", "").strip()
-        
-        subject = f"【每日证券分析】{current_date} 市场晨报 (Gemini 3版)"
-        if send_email_standalone(subject, html_content):
-            logger.info("🎉 任务完成！")
-        else:
-            logger.warning("⚠️ 邮件发送失败")
-            
-    except Exception as e:
-        logger.error(f"❌ 异常: {e}")
-        traceback.print_exc()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(generate_morning_brief())
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"❌ 顶级异常: {e}")
-        sys.exit(0)
+        # 兼容不同的调用方法
+        if hasattr(llm_client, 'chat'):
+            # 标准 Gemini 库通常没有 chat 方法直接返回文本，而是返回对象，但我们的 wrapper 或者是项目 analyzer 可能有
+            res = await llm_client.chat(prompt) if inspect.iscoroutinefunction(llm_client.chat) else llm_client.chat(prompt)
+            # 处理返回值可能是对象的情况
+            html_content = res if isinstance(res, str) else str(res)
+        elif hasattr(llm_client, 'analyze'):
+             # 项目可能的 analyze 方法
+             try: res = await llm_client.analyze(prompt)
+             except: res = await llm_client.analyze("000001", prompt) # 假 ticker
+             html_
